@@ -21,7 +21,6 @@ from opentelemetry.semconv._incubating.attributes.gen_ai_attributes import (
 )
 from opentelemetry.util.genai.handler import TelemetryHandler
 from opentelemetry.util.genai.invocation import (
-    EmbeddingInvocation,
     InferenceInvocation,
     RemoteAgentInvocation,
     RetrievalInvocation,
@@ -78,12 +77,7 @@ class _SdkCall:
 def _sdk_call(
     api_params: dict[str, Any], args: tuple[Any, ...], kwargs: dict[str, Any]
 ) -> _SdkCall:
-    """Replace a file-like ``body`` with a proxy that records the SDK's reads.
-
-    The caller's ``api_params`` is left as it is: the body is replaced in the
-    call that reaches the SDK, so the instrumentation sees the same parameters
-    the caller passed and the SDK reads the same bytes it would have read.
-    """
+    """Replace a file-like ``body`` with a recording proxy."""
     body_capture = capture_body(api_params.get("body"))
     if body_capture is None:
         return _SdkCall(api_params, None, args, kwargs)
@@ -99,26 +93,11 @@ def _sdk_call(
     )
 
 
-def _extract_safely(
-    extract: Callable[..., None],
-    params: dict[str, Any],
-    body_capture: BodyCapture | None,
-    invocation: InferenceInvocation | EmbeddingInvocation,
-    **kwargs: Any,
-) -> None:
-    """Populate request attributes from the captured body, ignoring failures.
-
-    Runs after the SDK call, on the content the capture recorded, and extracts
-    whatever the parameters and that content allow: a body the SDK did not read
-    whole leaves the body-derived attributes unset.
-    """
-    try:
-        if body_capture is not None:
-            snapshot = body_capture.snapshot()
-            params = {**params, "body": snapshot}
-        extract(params, invocation, **kwargs)
-    except Exception:
-        _logger.debug("Failed to read request attributes", exc_info=True)
+def _request_params(call: _SdkCall) -> dict[str, Any]:
+    """The request parameters, with a captured body replaced by its snapshot."""
+    if call.body_capture is None:
+        return call.params
+    return {**call.params, "body": call.body_capture.snapshot()}
 
 
 def _handle_converse(
@@ -252,7 +231,10 @@ def _handle_invoke_model(
         )
         call = _sdk_call(api_params, args, kwargs)
         try:
-            response: Any = wrapped(*call.args, **call.kwargs)
+            try:
+                response: Any = wrapped(*call.args, **call.kwargs)
+            finally:
+                extract_embedding_request(_request_params(call), invocation)
             raw_bytes = b""
             body_stream = response.get("body")
             if hasattr(body_stream, "read"):
@@ -261,21 +243,9 @@ def _handle_invoke_model(
                     io.BytesIO(raw_bytes), len(raw_bytes)
                 )
         except BaseException as exc:
-            _extract_safely(
-                extract_embedding_request,
-                call.params,
-                call.body_capture,
-                invocation,
-            )
             invocation.fail(exc)
             raise
 
-        _extract_safely(
-            extract_embedding_request,
-            call.params,
-            call.body_capture,
-            invocation,
-        )
         extract_embedding_response(
             response,
             raw_bytes,
@@ -293,25 +263,17 @@ def _handle_invoke_model(
     capture_content = handler.should_capture_content()
     call = _sdk_call(api_params, args, kwargs)
     try:
-        response = wrapped(*call.args, **call.kwargs)
+        try:
+            response = wrapped(*call.args, **call.kwargs)
+        finally:
+            extract_invoke_model_request(
+                _request_params(call),
+                invocation,
+                capture_content=capture_content,
+            )
     except BaseException as exc:
-        _extract_safely(
-            extract_invoke_model_request,
-            call.params,
-            call.body_capture,
-            invocation,
-            capture_content=capture_content,
-        )
         invocation.fail(exc)
         raise
-
-    _extract_safely(
-        extract_invoke_model_request,
-        call.params,
-        call.body_capture,
-        invocation,
-        capture_content=capture_content,
-    )
 
     if is_stream:
         if "body" in response:
@@ -371,23 +333,14 @@ async def _handle_async_invoke_model(
         )
         call = _sdk_call(api_params, args, kwargs)
         try:
-            response: Any = await wrapped(*call.args, **call.kwargs)
+            try:
+                response: Any = await wrapped(*call.args, **call.kwargs)
+            finally:
+                extract_embedding_request(_request_params(call), invocation)
         except BaseException as exc:
-            _extract_safely(
-                extract_embedding_request,
-                call.params,
-                call.body_capture,
-                invocation,
-            )
             invocation.fail(exc)
             raise
 
-        _extract_safely(
-            extract_embedding_request,
-            call.params,
-            call.body_capture,
-            invocation,
-        )
         body_stream = response.get("body")
         if body_stream is not None:
             if hasattr(body_stream, "read") and inspect.iscoroutinefunction(
@@ -429,25 +382,17 @@ async def _handle_async_invoke_model(
     capture_content = handler.should_capture_content()
     call = _sdk_call(api_params, args, kwargs)
     try:
-        response = await wrapped(*call.args, **call.kwargs)
+        try:
+            response = await wrapped(*call.args, **call.kwargs)
+        finally:
+            extract_invoke_model_request(
+                _request_params(call),
+                invocation,
+                capture_content=capture_content,
+            )
     except BaseException as exc:
-        _extract_safely(
-            extract_invoke_model_request,
-            call.params,
-            call.body_capture,
-            invocation,
-            capture_content=capture_content,
-        )
         invocation.fail(exc)
         raise
-
-    _extract_safely(
-        extract_invoke_model_request,
-        call.params,
-        call.body_capture,
-        invocation,
-        capture_content=capture_content,
-    )
 
     if is_stream:
         if "body" in response:
